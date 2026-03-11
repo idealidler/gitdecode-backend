@@ -7,7 +7,6 @@ from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load secrets from .env
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -16,10 +15,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI()
 
-# Allow the Chrome Extension to talk to this server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, we will lock this down, but '*' is safest for local testing
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,30 +34,30 @@ def fetch_github_data(username: str):
         'Content-Type': 'application/json',
     }
     
+    # UPGRADE: Added repositoryTopics (frameworks) and updatedAt (recency)
     query = f"""
     query {{
       user(login: "{username}") {{
         name
-        bio
         company
         location
         followers {{ totalCount }}
         repositories(first: 6, ownerAffiliations: OWNER, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
-          totalCount
           nodes {{
             name
-            description
             primaryLanguage {{ name }}
+            repositoryTopics(first: 4) {{
+              nodes {{
+                topic {{ name }}
+              }}
+            }}
             stargazerCount
-            forkCount
             updatedAt
           }}
         }}
         repositoriesContributedTo(first: 4, contributionTypes: [COMMIT, PULL_REQUEST, REPOSITORY]) {{
-          totalCount
           nodes {{
             name
-            description
             primaryLanguage {{ name }}
             stargazerCount
           }}
@@ -75,8 +73,13 @@ def fetch_github_data(username: str):
               name
               description
               primaryLanguage {{ name }}
+              repositoryTopics(first: 4) {{
+                nodes {{
+                  topic {{ name }}
+                }}
+              }}
               stargazerCount
-              forkCount
+              updatedAt
             }}
           }}
         }}
@@ -89,57 +92,99 @@ def fetch_github_data(username: str):
         raise Exception(f"GitHub API failed with status code {response.status_code}")
     return response.json()
 
+def clean_github_data(raw_data: dict) -> dict:
+    """ETL step: Parses the raw GraphQL JSON into a lean, flat dictionary."""
+    try:
+        user = raw_data.get('data', {}).get('user', {})
+        if not user:
+            return {"error": "No user data found"}
+
+        def get_lang(node):
+            return node.get('primaryLanguage', {}).get('name') if node.get('primaryLanguage') else "Unknown"
+
+        # UPGRADE: Helper to extract framework tags
+        def get_topics(node):
+            topics = node.get('repositoryTopics', {}).get('nodes', [])
+            return [t.get('topic', {}).get('name') for t in topics if t and t.get('topic')]
+
+        clean_data = {
+            "name": user.get('name'),
+            "company": user.get('company'),
+            "location": user.get('location'),
+            "followers": user.get('followers', {}).get('totalCount', 0),
+            "total_contributions_last_year": user.get('contributionsCollection', {}).get('contributionCalendar', {}).get('totalContributions', 0),
+            "pinned_repos": [
+                {
+                    "name": n.get('name'), 
+                    "lang": get_lang(n), 
+                    "frameworks": get_topics(n),
+                    "stars": n.get('stargazerCount', 0), 
+                    "desc": n.get('description'),
+                    "last_updated": n.get('updatedAt')
+                }
+                for n in user.get('pinnedItems', {}).get('nodes', []) if n
+            ],
+            "recent_repos": [
+                {
+                    "name": n.get('name'), 
+                    "lang": get_lang(n), 
+                    "frameworks": get_topics(n),
+                    "stars": n.get('stargazerCount', 0),
+                    "last_updated": n.get('updatedAt')
+                }
+                for n in user.get('repositories', {}).get('nodes', []) if n
+            ],
+            "contributed_to": [
+                {"name": n.get('name'), "lang": get_lang(n)}
+                for n in user.get('repositoriesContributedTo', {}).get('nodes', []) if n
+            ]
+        }
+        return clean_data
+    except Exception as e:
+        print(f"Data cleaning error: {e}")
+        return raw_data 
+
 @app.post("/generate-summary")
 async def generate_summary(data: RequestData):
     print(f"✅ Processing request for: {data.username}")
     
     try:
-        # 1. Fetch data from GitHub securely on the backend
         github_raw_data = fetch_github_data(data.username)
-        github_json_string = json.dumps(github_raw_data)
+        clean_data = clean_github_data(github_raw_data)
+        github_json_string = json.dumps(clean_data)
 
-        # 2. Production-Grade Rubric
         system_instruction = """
-        You are an expert technical recruiter assistant. Read the raw GitHub API JSON data and translate it into a highly scannable recruiter brief.
+        You are an expert technical recruiter assistant. Read the provided parsed GitHub data and output a strictly formatted JSON object.
 
-        RULES:
-        1. Use ONLY evidence visible in the GitHub data. If a signal is weak or missing, say so explicitly.
-        2. TECH STACK: Ignore markup, styling, config, and notebook formats. Treat Jupyter Notebook as Python. Focus on core engineering languages and technologies.
-        3. SENIORITY RUBRIC: Choose exactly one of these and do not hedge with multiple levels:
-           - Junior
-           - Mid-Level
-           - Senior
-           Default to Mid-Level if evidence is mixed or incomplete.
-        4. Keep each bullet concise and recruiter-friendly. No filler.
-        5. Mention specific repo names when citing evidence.
+        CRITICAL RULES:
+        1. FRAMEWORKS OVER LANGUAGES: Highlight frameworks (react, django, fastapi) over base languages.
+        2. RECENCY BIAS: Heavily weight repositories updated recently. 
+        3. SENIORITY RUBRIC: Choose exactly one: "Junior", "Mid-Level", or "Senior". Default to "Mid-Level" if unsure.
 
-        OUTPUT EXACTLY 5 BULLETS IN THIS FORMAT:
-        • **Snapshot:** [One-sentence overview of the candidate's likely profile and strongest technical theme.]
-        • **Seniority & Fit:** [Chosen level] [likely role/focus] [confidence: Low, Medium, or High].
-        • **Core Stack:** [Top languages/technologies plus brief specialization note.]
-        • **Evidence:** [Specific proof points from followers, contributions, pinned repos, recent repos, or contributed repos.]
-        • **Risks / Unknowns:** [What cannot be confidently inferred or what looks limited from GitHub alone.]
+        OUTPUT EXACTLY THIS JSON STRUCTURE:
+        {
+          "snapshot": "One-sentence overview of their strongest technical theme.",
+          "seniority": "Junior, Mid-Level, or Senior",
+          "role": "Likely role/focus (e.g., Data Engineer)",
+          "core_stack": ["Array", "of", "4 to 6", "Top", "Technologies"],
+          "evidence": "Specific proof points from repos, emphasizing recent impact.",
+          "risks": "What cannot be confidently inferred or looks limited."
+        }
         """
 
-        # 3. Call OpenAI
         ai_response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"}, # This forces OpenAI to return perfect JSON
             messages=[
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": f"Analyze this GitHub data for {data.username}:\n{github_json_string}"}
             ]
         )
         
-        ai_summary = ai_response.choices[0].message.content
-        return {"summary": ai_summary}
+        # Parse the JSON string from OpenAI into a real dictionary
+        ai_data = json.loads(ai_response.choices[0].message.content)
+        return {"summary": ai_data}
         
     except Exception as e:
         print(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.on_event("startup")
-async def startup_event():
-    print("\n" + "="*50)
-    print("🚀 SECURE API SERVER IS RUNNING")
-    print("📋 Copy this link to view your API docs: http://127.0.0.1:8000/docs")
-    print("="*50 + "\n")
