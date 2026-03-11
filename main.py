@@ -41,13 +41,42 @@ def fetch_github_data(username: str):
       user(login: "{username}") {{
         name
         bio
+        company
+        location
         followers {{ totalCount }}
+        repositories(first: 6, ownerAffiliations: OWNER, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+          totalCount
+          nodes {{
+            name
+            description
+            primaryLanguage {{ name }}
+            stargazerCount
+            forkCount
+            updatedAt
+          }}
+        }}
+        repositoriesContributedTo(first: 4, contributionTypes: [COMMIT, PULL_REQUEST, REPOSITORY]) {{
+          totalCount
+          nodes {{
+            name
+            description
+            primaryLanguage {{ name }}
+            stargazerCount
+          }}
+        }}
+        contributionsCollection {{
+          contributionCalendar {{
+            totalContributions
+          }}
+        }}
         pinnedItems(first: 3, types: REPOSITORY) {{
           nodes {{
             ... on Repository {{
               name
               description
               primaryLanguage {{ name }}
+              stargazerCount
+              forkCount
             }}
           }}
         }}
@@ -71,20 +100,25 @@ async def generate_summary(data: RequestData):
 
         # 2. Production-Grade Rubric
         system_instruction = """
-        You are an expert technical recruiter assistant. Read the raw GitHub API JSON data and translate it into a highly scannable summary.
-        
-        CRITICAL RULES FOR CONSISTENCY:
-        1. TECH STACK: Strictly ignore markup, configuration, or notebook formats (e.g., Jupyter Notebook, HTML, CSS, SCSS, Dockerfile). Classify Jupyter Notebook as "Python". Focus ONLY on core programming languages.
-        2. SENIORITY RUBRIC: You MUST choose exactly one of these three:
-           - "Junior": Projects look like bootcamp assignments, very few commits, or basic scripts.
-           - "Mid-Level": Complete, functional projects with good descriptions, or consistent activity. (DEFAULT TO THIS IF UNSURE).
-           - "Senior": Complex architecture, highly starred repositories, or deep open-source contributions.
-        3. Output EXACTLY 3 bullet points. Start the bullet directly with the data.
-        
-        FORMAT YOUR OUTPUT EXACTLY LIKE THIS:
-        • **Tech Stack:** [List the 3-4 core languages based on Rule 1].
-        • **Seniority & Focus:** [State Junior, Mid-Level, or Senior based on Rule 2] [State their focus, e.g., Data Engineer].
-        • **Impact & Signals:** [Mention follower count and highlight the single best project].
+        You are an expert technical recruiter assistant. Read the raw GitHub API JSON data and translate it into a highly scannable recruiter brief.
+
+        RULES:
+        1. Use ONLY evidence visible in the GitHub data. If a signal is weak or missing, say so explicitly.
+        2. TECH STACK: Ignore markup, styling, config, and notebook formats. Treat Jupyter Notebook as Python. Focus on core engineering languages and technologies.
+        3. SENIORITY RUBRIC: Choose exactly one of these and do not hedge with multiple levels:
+           - Junior
+           - Mid-Level
+           - Senior
+           Default to Mid-Level if evidence is mixed or incomplete.
+        4. Keep each bullet concise and recruiter-friendly. No filler.
+        5. Mention specific repo names when citing evidence.
+
+        OUTPUT EXACTLY 5 BULLETS IN THIS FORMAT:
+        • **Snapshot:** [One-sentence overview of the candidate's likely profile and strongest technical theme.]
+        • **Seniority & Fit:** [Chosen level] [likely role/focus] [confidence: Low, Medium, or High].
+        • **Core Stack:** [Top languages/technologies plus brief specialization note.]
+        • **Evidence:** [Specific proof points from followers, contributions, pinned repos, recent repos, or contributed repos.]
+        • **Risks / Unknowns:** [What cannot be confidently inferred or what looks limited from GitHub alone.]
         """
 
         # 3. Call OpenAI
