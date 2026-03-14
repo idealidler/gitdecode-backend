@@ -6,9 +6,13 @@ from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Import our new modular engines
 from github_service import GitHubService
 from metrics_engine import BehavioralMetricsEngine
+from feature_engine import FeatureEngineeringEngine
+from dimension_engine import DimensionScoringEngine
+from domain_inference import DomainInferenceEngine
+from placement_engine import PlacementEngine
+from evidence_engine import EvidenceGroupingEngine
 from scoring_engine import ProfileScoringEngine
 
 load_dotenv()
@@ -61,83 +65,91 @@ def _log_openai_request(system_instruction: str, user_content: str) -> None:
     )
 
 
-def _build_velocity_microcopy(metrics_payload: dict, scoring_payload: dict) -> str:
-    return (
-        f"{metrics_payload.get('commit_velocity_last_90_days', 0)} commits in the last 90 days "
-        f"across {metrics_payload.get('active_repositories_last_6_months', 0)} active repositories."
-    )
-
-
-def _build_lifecycle_microcopy(metrics_payload: dict, scoring_payload: dict) -> str:
-    return (
-        f"Average active repository lifespan is "
-        f"{metrics_payload.get('avg_active_repo_longevity_months', 0)} months."
-    )
-
-
-def _fallback_narrative(data: RequestData, metrics_payload: dict, scoring_payload: dict) -> dict:
+def _fallback_narrative(data: RequestData, metrics_payload: dict, scoring_payload: dict, placement_payload: dict) -> dict:
     name = metrics_payload.get("name") or data.username
     risk_flags = scoring_payload.get("risk_flags", [])
-    risk_text = (
-        "No material GitHub risks detected."
-        if risk_flags == ["no major deterministic risks"]
-        else ", ".join(risk_flags)
-    )
-    collaboration_profile = scoring_payload.get("collaboration_profile", "Balanced Collaborator")
-    stack = ", ".join(scoring_payload.get("core_stack", [])[:3]) or "their core stack"
-    merge_ratio = metrics_payload.get("pr_merge_ratio_pct", 0)
-    review_ratio = metrics_payload.get("review_to_pr_ratio", 0)
-    longevity = metrics_payload.get("avg_active_repo_longevity_months", 0)
+    no_risks = risk_flags == ["no major deterministic risks"]
+    domain_focus = scoring_payload.get("domain_focus", "Generalist Software Engineering")
+    placement_recommendations = placement_payload.get("placement_recommendations", [])
+    placement_text = placement_recommendations[0] if placement_recommendations else "general product engineering team"
     active_repos = metrics_payload.get("active_repositories_last_6_months", 0)
-    commit_velocity = metrics_payload.get("commit_velocity_last_90_days", 0)
+    owned_repos = metrics_payload.get("owned_repositories_count", 0)
+    followers = metrics_payload.get("followers", 0)
+    stars = metrics_payload.get("stars_on_owned_repos", 0)
+    repo_longevity = round(metrics_payload.get("avg_active_repo_longevity_months", 0))
+    execution_signal = next(
+        (signal.get("summary") for signal in scoring_payload.get("engineering_signals", []) if signal.get("label") == "Execution"),
+        "Shows sustained public engineering output."
+    )
+    commits_90d = metrics_payload.get("commit_velocity_last_90_days", 0)
+    prs_90d = metrics_payload.get("pull_requests_opened_last_90_days", 0)
 
     snapshot = (
-        f"{name}'s GitHub points to an engineer working primarily across {stack} with a mix of recent output, "
-        f"merged pull requests, and ongoing repository maintenance rather than a purely cosmetic profile. "
-        f"The visible work suggests someone contributing real code and staying engaged with active projects."
+        f"{name}'s public GitHub reads like a {domain_focus.lower()} profile with a real operating footprint rather than a portfolio-only presence. "
+        f"{execution_signal} The account has stayed active across {active_repos} repositories, with maintained work averaging about {repo_longevity} months and public traction from {followers} followers and {stars} stars on owned repositories."
     )
-    github_signal = (
-        f"{commit_velocity} recent commits across {active_repos} active repositories, a {merge_ratio}% PR merge ratio, "
-        f"and {review_ratio} reviews per PR suggest {name} is not just experimenting in isolation but showing "
-        f"{scoring_payload['execution_velocity'].lower()} execution with a {collaboration_profile.lower()} style. "
-        f"The {longevity}-month average repository lifespan also adds signal about follow-through and maintenance behavior."
+    github_activity_read = (
+        "Recent GitHub activity is exceptionally strong and sustained, with clear signs of active development rather than occasional maintenance."
+        if commits_90d >= 180 or (active_repos >= 5 and commits_90d >= 90)
+        else "Recent GitHub activity looks steady and real, with enough visible output to suggest ongoing development work."
+        if commits_90d >= 30 or active_repos >= 2 or prs_90d >= 3
+        else "Recent GitHub activity looks light or sporadic, so the public profile says less about current hands-on development than it does about older work."
     )
-    business_value = (
-        f"Place {name} into teams that need hands-on engineering output in {stack} and value contributors who can ship, "
-        f"work within an existing codebase, and show evidence of follow-through. "
-        f"This profile fits best where sustained execution and practical delivery matter more than resume polish."
+    placement_summary = (
+        f"Place {name} into a {placement_text.lower()} where visible ownership, sustained shipping, and technical judgment matter more than polished self-presentation. "
+        f"This profile is most useful in teams that need someone trusted to carry meaningful product or systems responsibility with a credible public body of work behind them."
     )
+    if no_risks:
+        risk_text = "No material GitHub risks detected."
+    else:
+        unknown_risks = []
+        concrete_risks = []
+        for flag in risk_flags:
+            if flag in {"low review participation", "low external collaboration"}:
+                unknown_risks.append(flag.replace("low ", "limited "))
+            else:
+                concrete_risks.append(flag.replace("shallow ", "limited "))
+
+        parts = []
+        if concrete_risks:
+            parts.append(f"GitHub raises some caution around {', '.join(concrete_risks)}.")
+        if unknown_risks:
+            parts.append(
+                f"Public GitHub also leaves some collaboration evidence unclear, especially around {', '.join(unknown_risks)}."
+            )
+        risk_text = " ".join(parts) or "No material GitHub risks detected."
 
     return {
+        "github_activity_read": github_activity_read,
         "snapshot": snapshot,
-        "github_signal": github_signal,
-        "business_value": business_value,
+        "placement_summary": placement_summary,
         "interview_risks": risk_text,
-        "velocity_microcopy": _build_velocity_microcopy(metrics_payload, scoring_payload),
-        "lifecycle_microcopy": _build_lifecycle_microcopy(metrics_payload, scoring_payload),
     }
 
 
-def _build_narrative_context(data: RequestData, metrics_payload: dict, scoring_payload: dict) -> dict:
+def _build_narrative_context(data: RequestData, metrics_payload: dict, feature_payload: dict, scoring_payload: dict, placement_payload: dict) -> dict:
     return {
         "name": metrics_payload.get("name") or data.username,
         "username": data.username,
-        "seniority_estimate": scoring_payload["seniority_estimate"],
-        "archetype": scoring_payload["archetype"],
-        "execution_velocity": scoring_payload["execution_velocity"],
-        "lifecycle_fit": scoring_payload["lifecycle_fit"],
-        "collaboration_profile": scoring_payload["collaboration_profile"],
+        "domain_focus": scoring_payload["domain_focus"],
+        "placement_recommendations": placement_payload["placement_recommendations"],
+        "environment_fit": placement_payload["environment_fit"],
+        "team_fit_tags": placement_payload["team_fit_tags"],
         "risk_flags": scoring_payload["risk_flags"],
-        "core_stack": scoring_payload["core_stack"],
-        "metrics": {
-            "commit_velocity_last_90_days": metrics_payload.get("commit_velocity_last_90_days", 0),
+        "engineering_signals": scoring_payload["engineering_signals"],
+        "profile": feature_payload["profile"],
+        "evidence": {
+            "account_age_months": metrics_payload.get("account_age_months", 0),
+            "followers": metrics_payload.get("followers", 0),
+            "owned_repositories_count": metrics_payload.get("owned_repositories_count", 0),
             "active_repositories_last_6_months": metrics_payload.get("active_repositories_last_6_months", 0),
-            "pr_merge_ratio_pct": metrics_payload.get("pr_merge_ratio_pct", 0),
-            "review_to_pr_ratio": metrics_payload.get("review_to_pr_ratio", 0),
-            "code_reviews_conducted": metrics_payload.get("code_reviews_conducted", 0),
             "avg_active_repo_longevity_months": metrics_payload.get("avg_active_repo_longevity_months", 0),
-            "external_pr_ratio": metrics_payload.get("external_pr_ratio", 0),
+            "commit_velocity_last_90_days": metrics_payload.get("commit_velocity_last_90_days", 0),
+            "pull_requests_opened_last_90_days": metrics_payload.get("pull_requests_opened_last_90_days", 0),
             "repositories_contributed_to": metrics_payload.get("repositories_contributed_to", 0),
+            "code_reviews_conducted": metrics_payload.get("code_reviews_conducted", 0),
+            "stars_on_owned_repos": metrics_payload.get("stars_on_owned_repos", 0),
+            "forks_on_owned_repos": metrics_payload.get("forks_on_owned_repos", 0),
         },
     }
 
@@ -157,59 +169,48 @@ async def generate_summary(data: RequestData):
         if "error" in metrics_payload:
             raise HTTPException(status_code=404, detail="GitHub user data could not be parsed.")
 
-        scoring_engine = ProfileScoringEngine(metrics_payload)
+        feature_engine = FeatureEngineeringEngine(metrics_payload)
+        feature_payload = feature_engine.generate_payload()
+
+        dimension_engine = DimensionScoringEngine(metrics_payload, feature_payload)
+        dimension_payload = dimension_engine.generate_payload()
+
+        domain_engine = DomainInferenceEngine(metrics_payload)
+        domain_payload = domain_engine.generate_payload()
+
+        scoring_engine = ProfileScoringEngine(metrics_payload, feature_payload, dimension_payload, domain_payload)
         scoring_payload = scoring_engine.generate_payload()
-        narrative_context = _build_narrative_context(data, metrics_payload, scoring_payload)
 
-        # 3. Ask AI only for prose, not for label assignment
+        placement_engine = PlacementEngine(metrics_payload, scoring_payload["dimension_scores"], domain_payload)
+        placement_payload = placement_engine.generate_payload()
+
+        evidence_engine = EvidenceGroupingEngine(metrics_payload)
+        evidence_groups = evidence_engine.generate_payload()
+
+        narrative_context = _build_narrative_context(data, metrics_payload, feature_payload, scoring_payload, placement_payload)
+
         system_instruction = """
-        You are writing recruiter-facing copy for a GitHub analysis widget.
+        Write concise recruiter-facing copy for a GitHub analysis widget. The UI already shows deterministic labels, stack, stats, and evidence, so add judgment, not repetition.
 
-        Use the deterministic payload exactly as provided. Do not change, reinterpret, or restate the deterministic labels.
+        Use the input as truth. Do not invent facts or reinterpret deterministic labels, scores, tags, recommendations, or numeric evidence.
 
-        The widget has four sections. Each field must have a distinct job and must not feel redundant:
+        Output:
+        - github_activity_read: exactly 1 sentence; a direct read of the person's recent GitHub activity only; comment on whether recent activity looks active, sustained, sporadic, light, or strong; mention what stands out about recent GitHub behavior; do not summarize the whole profile; no seniority, archetype, stack labels, or raw numbers.
+        - snapshot: exactly 2 sentences; sentence 1 = technical identity and engineering shape, sentence 2 = what the public GitHub footprint suggests about credibility, consistency, ownership, or working style; avoid visible labels and numbers unless necessary.
+        - placement_summary: exactly 2 sentences; answer "Where would I place this person?"; sentence 1 = best-fit team or environment, sentence 2 = hiring problem or responsibility they seem suited for; use placement recommendations and environment fit; do not repeat snapshot or raw metrics.
+        - interview_risks: 1 or 2 sentences; translate risk flags into recruiter cautions or unknowns; distinguish true caution from missing public evidence; if there are no meaningful risks, return exactly "No material GitHub risks detected."
 
-        1. snapshot
-        - 2 sentences max.
-        - Purpose: describe the candidate's technical identity and whether the GitHub looks meaningfully active.
-        - Do not mention seniority, archetype, confidence, risk flags, or direct team placement.
-        - Do not simply restate the visible top-skills list.
+        Style:
+        - Write for recruiters and hiring managers in plain-English, specific, unsentimental language.
+        - Use the real name when present; otherwise use the username.
+        - Keep it personal but not casual. Do not guess gender; use the name or neutral phrasing unless gender is explicit in the input.
+        - Avoid hype, generic praise, repeated phrasing, and repeating strengths in interview_risks.
+        - If the profile looks like a maintainer-founder workflow rather than a PR-heavy contributor workflow, do not frame low PR or review counts as weakness unless the risk flags require it.
 
-        2. github_signal
-        - 2 sentences max.
-        - Purpose: explain what the activity pattern says about engineering behavior.
-        - Focus on behavior signals like shipping consistency, collaboration, ownership, review participation, and maintenance follow-through.
-        - Do not recommend teams or roles here.
-
-        3. business_value
-        - 2 sentences max.
-        - Purpose: answer "Where would I place this person?"
-        - Describe the type of team, environment, or hiring use case where this person looks strongest.
-        - Do not repeat raw metrics or restate github_signal.
-
-        4. interview_risks
-        - 2 sentences max.
-        - Purpose: translate deterministic risk flags into concise recruiter concerns or unknowns.
-        - If there are no meaningful risks, return exactly: "No material GitHub risks detected."
-        - Do not repeat strengths here.
-
-        Global rules:
-        - Write for recruiters and hiring managers.
-        - Use the candidate's provided name.
-        - Keep the tone analytical, direct, and plain-English.
-        - Avoid buzzwords, hype, and filler.
-        - Avoid repeating the same idea across fields.
-
-        Return STRICT JSON:
-        {
-          "snapshot": "...",
-          "github_signal": "...",
-          "business_value": "...",
-          "interview_risks": "..."
-        }
+        Return a strict JSON object with exactly these keys: github_activity_read, snapshot, placement_summary, interview_risks.
         """
 
-        narrative = _fallback_narrative(data, metrics_payload, scoring_payload)
+        narrative = _fallback_narrative(data, metrics_payload, scoring_payload, placement_payload)
 
         if client:
             try:
@@ -245,15 +246,20 @@ async def generate_summary(data: RequestData):
             **narrative,
             "seniority_estimate": scoring_payload["seniority_estimate"],
             "archetype": scoring_payload["archetype"],
-            "execution_velocity": scoring_payload["execution_velocity"],
-            "lifecycle_fit": scoring_payload["lifecycle_fit"],
+            "domain_focus": scoring_payload["domain_focus"],
+            "secondary_domain_focus": scoring_payload["secondary_domain_focus"],
             "risk_flags": scoring_payload["risk_flags"],
             "core_stack": scoring_payload["core_stack"],
+            "dimension_scores": scoring_payload["dimension_scores"],
+            "engineering_signals": scoring_payload["engineering_signals"],
+            "creator_signal": scoring_payload["creator_signal"],
+            "placement_recommendations": placement_payload["placement_recommendations"],
+            "environment_fit": placement_payload["environment_fit"],
+            "team_fit_tags": placement_payload["team_fit_tags"],
             "rule_trace": scoring_payload["rule_trace"],
             "raw_evidence": scoring_payload["raw_evidence"],
+            "evidence_groups": evidence_groups,
         }
-        response_payload["velocity_microcopy"] = _build_velocity_microcopy(metrics_payload, scoring_payload)
-        response_payload["lifecycle_microcopy"] = _build_lifecycle_microcopy(metrics_payload, scoring_payload)
 
         return {"summary": response_payload}
         

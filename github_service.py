@@ -31,6 +31,16 @@ class GitHubService:
         query {{
           user(login: "{username}") {{
             name
+            bio
+            company
+            location
+            createdAt
+            followers {{
+              totalCount
+            }}
+            following {{
+              totalCount
+            }}
             # 1. Time-boxed Velocity & Review Signals (Last 90 Days)
             contributionsCollection(from: "{ninety_days_ago}") {{
               totalCommitContributions
@@ -54,13 +64,34 @@ class GitHubService:
             
             # 3. Repository Quality & Tech Stack (Top 50 recently updated)
             repositories(first: 50, ownerAffiliations: OWNER, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+              totalCount
               nodes {{
                 createdAt
                 updatedAt
+                description
+                isArchived
+                isFork
+                stargazerCount
+                forkCount
                 primaryLanguage {{ name }}
                 repositoryTopics(first: 5) {{
                   nodes {{
                     topic {{ name }}
+                  }}
+                }}
+              }}
+            }}
+
+            pinnedItems(first: 6, types: REPOSITORY) {{
+              nodes {{
+                ... on Repository {{
+                  name
+                  stargazerCount
+                  primaryLanguage {{ name }}
+                  repositoryTopics(first: 5) {{
+                    nodes {{
+                      topic {{ name }}
+                    }}
                   }}
                 }}
               }}

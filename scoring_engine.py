@@ -4,13 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 
-def _score_from_thresholds(value: float, thresholds: List[Tuple[float, int]]) -> int:
-    for threshold, score in thresholds:
-        if value >= threshold:
-            return score
-    return 0
-
-
 @dataclass(frozen=True)
 class ScoreTrace:
     category: str
@@ -29,99 +22,172 @@ class ScoreTrace:
         }
 
 
-class ProfileScoringEngine:
-    SENIORITY_THRESHOLDS = {
-        "review_to_pr_ratio": [(0.8, 4), (0.5, 3), (0.25, 2), (0.1, 1)],
-        "code_reviews_conducted": [(40, 4), (15, 3), (5, 2), (1, 1)],
-        "pr_merge_ratio_pct": [(90, 3), (75, 2), (60, 1)],
-        "avg_active_repo_longevity_months": [(24, 3), (12, 2), (3, 1)],
-        "active_repositories_last_6_months": [(8, 2), (4, 1)],
-        "commit_velocity_last_90_days": [(220, 3), (90, 2), (25, 1)],
-    }
+def _bucket(score: int, low: str, medium: str, high: str) -> str:
+    if score >= 75:
+        return high
+    if score >= 45:
+        return medium
+    return low
 
-    def __init__(self, metrics_payload: Dict[str, Any]):
+
+class ProfileScoringEngine:
+    def __init__(self, metrics_payload: Dict[str, Any], feature_payload: Dict[str, Any], dimension_payload: Dict[str, Any], domain_payload: Dict[str, Any]):
         self.metrics = metrics_payload
+        self.features = feature_payload
+        self.dimensions = dimension_payload["scores"]
+        self.domain_focus = domain_payload["primary_domain"]
+        self.secondary_domain_focus = domain_payload["secondary_domain"]
+        self.domain_scorecard = domain_payload["scorecard"]
         self.traces: List[ScoreTrace] = []
 
     def _trace(self, category: str, signal: str, value: Any, impact: str, reason: str) -> None:
         self.traces.append(ScoreTrace(category, signal, value, impact, reason))
 
-    def _score_seniority(self) -> Tuple[str, str, int]:
-        score = 0
-        m = self.metrics
+    def _is_maintainer_workflow_profile(self) -> bool:
+        return (
+            self.metrics.get("pull_requests_opened_last_90_days", 0) == 0
+            and self.metrics.get("total_recent_prs", 0) == 0
+            and self.metrics.get("commit_velocity_last_90_days", 0) >= 150
+            and self.metrics.get("avg_active_repo_longevity_months", 0) >= 24
+            and self.metrics.get("active_repositories_last_6_months", 0) >= 3
+            and (
+                self.metrics.get("stars_on_owned_repos", 0) >= 10000
+                or self.dimensions.get("public_credibility", 0) >= 80
+            )
+        )
 
-        review_ratio = m.get("review_to_pr_ratio", 0.0)
-        review_score = _score_from_thresholds(review_ratio, self.SENIORITY_THRESHOLDS["review_to_pr_ratio"])
-        score += review_score
-        if review_score >= 3:
-            self._trace("seniority", "review_to_pr_ratio", review_ratio, "positive", "High review participation points toward senior/staff behavior.")
-        elif review_score == 0:
-            self._trace("seniority", "review_to_pr_ratio", review_ratio, "negative", "Very limited review participation weakens seniority confidence.")
+    def _is_high_impact_creator_profile(self) -> bool:
+        return (
+            self.metrics.get("stars_on_owned_repos", 0) >= 10000
+            or self.metrics.get("followers", 0) >= 10000
+            or (
+                self.dimensions.get("public_credibility", 0) >= 72
+                and self.dimensions.get("ownership", 0) >= 55
+                and self.dimensions.get("execution", 0) >= 55
+            )
+        )
 
-        reviews = m.get("code_reviews_conducted", 0)
-        reviews_score = _score_from_thresholds(reviews, self.SENIORITY_THRESHOLDS["code_reviews_conducted"])
-        score += reviews_score
-        if reviews_score >= 3:
-            self._trace("seniority", "code_reviews_conducted", reviews, "positive", "High review volume suggests mentorship and team influence.")
+    def _core_stack(self) -> List[str]:
+        stack: List[str] = []
+        seen = set()
+        candidates = (
+            self.metrics.get("top_languages", [])
+            + self.metrics.get("dominant_frameworks", [])
+            + self.metrics.get("pinned_languages", [])
+        )
+        for item in candidates:
+            normalized = str(item).strip().lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                stack.append(item)
+            if len(stack) >= 5:
+                break
+        return stack
 
-        merge_ratio = m.get("pr_merge_ratio_pct", 0.0)
-        merge_score = _score_from_thresholds(merge_ratio, self.SENIORITY_THRESHOLDS["pr_merge_ratio_pct"])
-        score += merge_score
-        if merge_score >= 2:
-            self._trace("seniority", "pr_merge_ratio_pct", merge_ratio, "positive", "Strong PR merge quality indicates production alignment.")
-        elif merge_score == 0 and m.get("total_recent_prs", 0) >= 5:
-            self._trace("seniority", "pr_merge_ratio_pct", merge_ratio, "negative", "Low merge ratio weakens production-readiness signals.")
+    def _score_seniority(self) -> str:
+        execution = self.dimensions["execution"]
+        collaboration = self.dimensions["collaboration"]
+        ownership = self.dimensions["ownership"]
+        maintenance = self.dimensions["maintenance"]
+        maturity = self.dimensions["delivery_maturity"]
+        public_credibility = self.dimensions["public_credibility"]
+        maintainer_workflow = self._is_maintainer_workflow_profile()
+        high_impact_creator = self._is_high_impact_creator_profile()
 
-        longevity = m.get("avg_active_repo_longevity_months", 0.0)
-        longevity_score = _score_from_thresholds(longevity, self.SENIORITY_THRESHOLDS["avg_active_repo_longevity_months"])
-        score += longevity_score
-        if longevity_score >= 2:
-            self._trace("seniority", "avg_active_repo_longevity_months", longevity, "positive", "Longer-lived active repositories indicate system stewardship.")
+        composite = round(
+            (execution * 0.18)
+            + (collaboration * 0.08)
+            + (ownership * 0.24)
+            + (maintenance * 0.18)
+            + (maturity * 0.12)
+            + (public_credibility * 0.2)
+        )
 
-        active_repos = m.get("active_repositories_last_6_months", 0)
-        active_score = _score_from_thresholds(active_repos, self.SENIORITY_THRESHOLDS["active_repositories_last_6_months"])
-        score += active_score
-        if active_score >= 1:
-            self._trace("seniority", "active_repositories_last_6_months", active_repos, "positive", "Recent activity across repositories strengthens consistency.")
-
-        commits = m.get("commit_velocity_last_90_days", 0)
-        commit_score = _score_from_thresholds(commits, self.SENIORITY_THRESHOLDS["commit_velocity_last_90_days"])
-        score += commit_score
-        if commit_score >= 2:
-            self._trace("seniority", "commit_velocity_last_90_days", commits, "positive", "Strong recent activity supports sustained execution.")
-
-        if score >= 15:
+        if (
+            maintainer_workflow
+            and maintenance >= 60
+            and ownership >= 60
+            and (
+                public_credibility >= 60
+                or self.metrics.get("stars_on_owned_repos", 0) >= 100000
+            )
+        ):
             label = "Staff"
-        elif score >= 10:
+            self._trace(
+                "seniority",
+                "maintainer_override",
+                {
+                    "public_credibility": public_credibility,
+                    "ownership": ownership,
+                    "maintenance": maintenance,
+                    "commit_velocity_last_90_days": self.metrics.get("commit_velocity_last_90_days", 0),
+                },
+                "positive",
+                "Founder-maintainer workflow override assigned Staff despite low PR/review workflow signals."
+            )
+        elif (
+            high_impact_creator
+            and public_credibility >= 70
+            and ownership >= 55
+            and (execution >= 55 or maintenance >= 65)
+        ):
+            label = "Staff"
+            self._trace(
+                "seniority",
+                "creator_override",
+                {
+                    "public_credibility": public_credibility,
+                    "execution": execution,
+                    "ownership": ownership,
+                    "stars_on_owned_repos": self.metrics.get("stars_on_owned_repos", 0),
+                    "followers": self.metrics.get("followers", 0),
+                },
+                "positive",
+                "High-impact public creator override assigned Staff despite lighter collaboration workflow signals."
+            )
+        elif (
+            high_impact_creator
+            and public_credibility >= 58
+            and execution >= 45
+            and ownership >= 45
+        ):
             label = "Senior"
-        elif score >= 5:
+            self._trace(
+                "seniority",
+                "creator_floor",
+                {
+                    "public_credibility": public_credibility,
+                    "execution": execution,
+                    "ownership": ownership,
+                    "stars_on_owned_repos": self.metrics.get("stars_on_owned_repos", 0),
+                    "followers": self.metrics.get("followers", 0),
+                },
+                "positive",
+                "High-impact public creator floor prevented seniority from being dragged down by review-centric collaboration gaps."
+            )
+        elif public_credibility >= 88 and ownership >= 72 and maintenance >= 50:
+            label = "Staff"
+        elif composite >= 74:
+            label = "Staff"
+        elif composite >= 52:
+            label = "Senior"
+        elif composite >= 34:
             label = "Mid-Level"
         else:
             label = "Junior"
 
-        confidence = self._confidence_for_score(
-            score=score,
-            max_score=19,
-            sparse_data=self._is_sparse_profile(),
-            contradictory=self._has_conflicting_signals(),
-        )
-
-        self._trace("seniority", "final_score", score, "neutral", f"Deterministic seniority assigned as {label}.")
-        return label, confidence, score
+        self._trace("seniority", "dimension_composite", composite, "neutral", f"Seniority assigned from execution, collaboration, ownership, maintenance, and delivery maturity as {label}.")
+        return label
 
     def _score_execution_velocity(self) -> str:
-        commits = self.metrics.get("commit_velocity_last_90_days", 0)
-        active_repos = self.metrics.get("active_repositories_last_6_months", 0)
-        repos_contributed = self.metrics.get("repositories_contributed_to", 0)
-
-        if commits >= 180 or (commits >= 120 and active_repos >= 4):
+        score = self.dimensions["execution"]
+        if score >= 62:
             label = "Top 10% Contributor"
-        elif commits >= 35 or active_repos >= 2 or repos_contributed >= 2:
+        elif score >= 35:
             label = "Consistent Output"
         else:
             label = "Sporadic / Bursty"
-
-        self._trace("velocity", "execution_velocity", {"commits": commits, "active_repos": active_repos}, "neutral", f"Deterministic execution velocity assigned as {label}.")
+        self._trace("velocity", "execution", score, "neutral", f"Execution velocity assigned as {label}.")
         return label
 
     def _score_lifecycle_fit(self) -> str:
@@ -132,196 +198,196 @@ class ProfileScoringEngine:
             label = "Core Contributor"
         else:
             label = "Scale & Optimize"
-        self._trace("lifecycle", "avg_active_repo_longevity_months", longevity, "neutral", f"Deterministic lifecycle fit assigned as {label}.")
+        self._trace("lifecycle", "avg_active_repo_longevity_months", longevity, "neutral", f"Lifecycle fit assigned as {label}.")
         return label
 
     def _score_collaboration_profile(self) -> str:
-        review_ratio = self.metrics.get("review_to_pr_ratio", 0.0)
-        external_ratio = self.metrics.get("external_pr_ratio", 0.0)
-        reviews = self.metrics.get("code_reviews_conducted", 0)
+        score = self.dimensions["collaboration"]
+        return _bucket(score, "Primarily Individual Contributor", "Balanced Collaborator", "Mentor / Reviewer")
 
-        if review_ratio >= 0.6 or reviews >= 25:
-            return "Mentor / Reviewer"
-        if external_ratio >= 0.35:
-            return "Cross-team Collaborator"
-        if review_ratio >= 0.2:
-            return "Balanced Collaborator"
-        return "Primarily Individual Contributor"
+    def _score_archetype(self) -> str:
+        external_weight = int(self.metrics.get("external_pr_ratio", 0) * 160)
+        stars = self.metrics.get("stars_on_owned_repos", 0)
+        public_credibility = self.dimensions["public_credibility"]
+        ownership = self.dimensions["ownership"]
+        maintainer_workflow = self._is_maintainer_workflow_profile()
 
-    def _score_archetype(self) -> Tuple[str, str]:
-        m = self.metrics
-        commits = m.get("commit_velocity_last_90_days", 0)
-        active_repos = m.get("active_repositories_last_6_months", 0)
-        longevity = m.get("avg_active_repo_longevity_months", 0.0)
-        review_ratio = m.get("review_to_pr_ratio", 0.0)
-        reviews = m.get("code_reviews_conducted", 0)
-        merge_ratio = m.get("pr_merge_ratio_pct", 0.0)
-        external_ratio = m.get("external_pr_ratio", 0.0)
-        repos_contributed = m.get("repositories_contributed_to", 0)
-        language_breadth = len(m.get("top_languages", []))
-        framework_breadth = len(m.get("dominant_frameworks", []))
-        breadth = language_breadth + framework_breadth
+        if (
+            maintainer_workflow
+            and ownership >= 60
+            and (
+                public_credibility >= 60
+                or stars >= 100000
+                or self.metrics.get("avg_active_repo_longevity_months", 0) >= 48
+            )
+        ):
+            archetype = "OSS Titan"
+            self._trace(
+                "archetype",
+                "maintainer_override",
+                {"public_credibility": public_credibility, "ownership": ownership, "stars_on_owned_repos": stars},
+                "positive",
+                "Founder-maintainer workflow override assigned OSS Titan."
+            )
+            return archetype
+
+        if stars >= 50000 and ownership >= 55:
+            archetype = "OSS Titan"
+            self._trace("archetype", "creator_override", {"stars_on_owned_repos": stars, "ownership": ownership}, "positive", "High-impact public creator override assigned as OSS Titan.")
+            return archetype
+
+        if public_credibility >= 70 and ownership >= 55 and self.dimensions["maintenance"] >= 70:
+            archetype = "OSS Titan"
+            self._trace(
+                "archetype",
+                "credibility_override",
+                {
+                    "public_credibility": public_credibility,
+                    "ownership": ownership,
+                    "maintenance": self.dimensions["maintenance"],
+                },
+                "positive",
+                "High-impact creator with strong maintenance and ownership assigned as OSS Titan."
+            )
+            return archetype
 
         scores = {
-            "OSS Titan": 0,
-            "Enterprise Architect": 0,
-            "Product Builder": 0,
-            "Consistent Craftsman": 0,
-            "Startup Generalist": 0,
-            "Deep Specialist": 0,
-            "Rapid Experimenter": 0,
-            "Portfolio Builder": 0,
-            "Early Career Developer": 0,
+            "OSS Titan": self.dimensions["oss_presence"] + external_weight + int(self.metrics.get("repositories_contributed_to", 0) * 6) + public_credibility,
+            "Enterprise Architect": self.dimensions["maintenance"] + self.dimensions["delivery_maturity"],
+            "Product Builder": self.dimensions["execution"] + self.dimensions["ownership"],
+            "Consistent Craftsman": self.dimensions["execution"] + self.dimensions["maintenance"],
+            "Startup Generalist": self.dimensions["execution"] + self.dimensions["technical_breadth"] + self.dimensions["ownership"],
+            "Deep Specialist": self.dimensions["maintenance"] + max(0, 100 - self.dimensions["technical_breadth"]),
+            "Rapid Experimenter": self.dimensions["execution"] + max(0, 100 - self.dimensions["maintenance"]),
+            "Portfolio Builder": self.dimensions["ownership"] + self.dimensions["technical_breadth"],
+            "Early Career Developer": max(0, 120 - self.dimensions["execution"] - self.dimensions["collaboration"]),
+        }
+        archetype = max(scores, key=scores.get)
+        self._trace("archetype", "archetype_scorecard", sorted(scores.items(), key=lambda item: item[1], reverse=True)[:3], "neutral", f"Archetype assigned as {archetype}.")
+        return archetype
+
+    def _engineering_signals(self) -> List[Dict[str, Any]]:
+        score_map = {
+            "Execution": self.dimensions["execution"],
+            "Collaboration": self.dimensions["collaboration"],
+            "Ownership": self.dimensions["ownership"],
+            "Maintenance": self.dimensions["maintenance"],
         }
 
-        scores["OSS Titan"] += 4 if external_ratio >= 0.45 else 0
-        scores["OSS Titan"] += 3 if repos_contributed >= 4 else 0
-        scores["OSS Titan"] += 2 if reviews >= 15 else 0
+        signal_copy = {
+            "Execution": _bucket(
+                score_map["Execution"],
+                "Output is visible but not yet consistently sustained across recent public work.",
+                "Shows steady delivery across recent GitHub activity without looking purely experimental.",
+                "Shows sustained recent output with enough volume to look like meaningful engineering work."
+            ),
+            "Collaboration": _bucket(
+                score_map["Collaboration"],
+                "Public GitHub suggests limited review participation and fewer collaborative signals so far.",
+                "Signals a healthy mix of shipping and participating in team workflows.",
+                "Strong review participation suggests mentorship, influence, or active involvement in shared code quality."
+            ),
+            "Ownership": _bucket(
+                score_map["Ownership"],
+                "Public ownership signals are present but still fairly shallow or early-stage.",
+                "Shows clear evidence of owning repositories and curating a real technical footprint.",
+                "Strong ownership signal through maintained repositories, visible footprint, and credible public project presence."
+            ),
+            "Maintenance": _bucket(
+                score_map["Maintenance"],
+                "The profile leans more toward short-lived or newer work than long-term stewardship.",
+                "Shows evidence of shipping within existing codebases and maintaining active repositories.",
+                "Strong maintenance signal with longer-lived active repositories and production-aligned merge behavior."
+            ),
+        }
 
-        scores["Enterprise Architect"] += 4 if longevity >= 18 else 0
-        scores["Enterprise Architect"] += 3 if review_ratio >= 0.5 else 0
-        scores["Enterprise Architect"] += 2 if merge_ratio >= 80 else 0
+        cards = []
+        for label, score in score_map.items():
+            cards.append({
+                "label": label,
+                "score": score,
+                "summary": signal_copy[label],
+            })
+        return cards
 
-        scores["Product Builder"] += 4 if commits >= 120 else 0
-        scores["Product Builder"] += 3 if active_repos >= 4 else 0
-        scores["Product Builder"] += 2 if 3 <= longevity <= 18 else 0
+    def _creator_signal(self) -> Dict[str, Any]:
+        stars = self.metrics.get("stars_on_owned_repos", 0)
+        contributed_projects = self.metrics.get("repositories_contributed_to", 0)
+        score = self.dimensions.get("public_credibility", 0)
 
-        scores["Consistent Craftsman"] += 4 if 35 <= commits < 180 else 0
-        scores["Consistent Craftsman"] += 3 if merge_ratio >= 80 else 0
-        scores["Consistent Craftsman"] += 2 if review_ratio >= 0.2 else 0
+        if score >= 70:
+            summary = "Strong public creator signal with visible traction on owned repositories and evidence of contribution breadth across multiple projects."
+        elif score >= 45:
+            summary = "Credible public creator signal with some traction on owned work and contribution activity beyond a single codebase."
+        else:
+            summary = "Early-stage public creator signal; there is some visible work, but limited public traction or contribution breadth so far."
 
-        scores["Startup Generalist"] += 3 if commits >= 100 else 0
-        scores["Startup Generalist"] += 3 if active_repos >= 4 else 0
-        scores["Startup Generalist"] += 2 if breadth >= 5 else 0
-        scores["Startup Generalist"] += 1 if longevity < 12 else 0
+        self._trace(
+            "creator_signal",
+            "public_credibility",
+            {"score": score, "stars_on_owned_repos": stars, "repositories_contributed_to": contributed_projects},
+            "neutral",
+            "Creator signal assigned from repository traction and number of projects contributed to."
+        )
+        return {
+            "score": score,
+            "stars_on_owned_repos": stars,
+            "repositories_contributed_to": contributed_projects,
+            "summary": summary,
+        }
 
-        scores["Deep Specialist"] += 3 if breadth <= 3 else 0
-        scores["Deep Specialist"] += 3 if longevity >= 12 else 0
-        scores["Deep Specialist"] += 2 if review_ratio >= 0.3 else 0
-
-        scores["Rapid Experimenter"] += 4 if longevity < 3 else 0
-        scores["Rapid Experimenter"] += 3 if active_repos >= 3 else 0
-        scores["Rapid Experimenter"] += 2 if commits >= 80 else 0
-
-        scores["Portfolio Builder"] += 4 if active_repos >= 5 else 0
-        scores["Portfolio Builder"] += 3 if breadth >= 5 else 0
-        scores["Portfolio Builder"] += 2 if longevity < 6 else 0
-        scores["Portfolio Builder"] += 1 if review_ratio < 0.2 else 0
-
-        scores["Early Career Developer"] += 4 if commits < 25 else 0
-        scores["Early Career Developer"] += 3 if reviews < 3 else 0
-        scores["Early Career Developer"] += 2 if longevity < 6 else 0
-        scores["Early Career Developer"] += 2 if merge_ratio < 70 else 0
-
-        top_archetype = max(scores, key=scores.get)
-        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        top_score = ordered[0][1]
-        second_score = ordered[1][1]
-
-        confidence = "High" if top_score - second_score >= 3 and top_score >= 7 else "Medium"
-        if self._is_sparse_profile():
-            confidence = "Low"
-
-        self._trace("archetype", "archetype_scorecard", ordered[:3], "neutral", f"Deterministic archetype assigned as {top_archetype}.")
-        return top_archetype, confidence
-
-    def _derive_risk_flags(self) -> Tuple[List[str], str]:
+    def _derive_risk_flags(self) -> List[str]:
         flags: List[str] = []
         m = self.metrics
+        d = self.dimensions
+        maintainer_workflow = self._is_maintainer_workflow_profile()
 
-        if m.get("review_to_pr_ratio", 0.0) < 0.15 and m.get("code_reviews_conducted", 0) < 5:
+        if d["collaboration"] < 35 and not maintainer_workflow:
             flags.append("low review participation")
-        if m.get("external_pr_ratio", 0.0) < 0.1 and m.get("repositories_contributed_to", 0) < 2:
+        if (
+            m.get("external_pr_ratio", 0.0) < 0.1
+            and m.get("repositories_contributed_to", 0) < 2
+            and not maintainer_workflow
+        ):
             flags.append("low external collaboration")
         if m.get("pr_merge_ratio_pct", 0.0) < 60 and m.get("total_recent_prs", 0) >= 5:
             flags.append("low merge success")
-        if m.get("avg_active_repo_longevity_months", 0.0) < 3 and m.get("active_repositories_last_6_months", 0) >= 2:
+        if d["maintenance"] < 35 and m.get("active_repositories_last_6_months", 0) >= 2:
             flags.append("shallow maintenance history")
-        if m.get("commit_velocity_last_90_days", 0) < 20 and m.get("active_repositories_last_6_months", 0) < 2:
+        if d["execution"] < 25:
             flags.append("low recent activity")
 
         if not flags:
             flags.append("no major deterministic risks")
 
         for flag in flags:
-            self._trace("risk", "risk_flag", flag, "neutral", f"Deterministic risk flag added: {flag}.")
-
-        confidence = "Low" if self._is_sparse_profile() else "High" if len(flags) <= 2 else "Medium"
-        return flags, confidence
-
-    def _is_sparse_profile(self) -> bool:
-        commits = self.metrics.get("commit_velocity_last_90_days", 0)
-        reviews = self.metrics.get("code_reviews_conducted", 0)
-        active_repos = self.metrics.get("active_repositories_last_6_months", 0)
-        recent_prs = self.metrics.get("total_recent_prs", 0)
-        strong_signal_count = sum(1 for value in [commits >= 20, reviews >= 3, active_repos >= 2, recent_prs >= 3] if value)
-        return strong_signal_count <= 1
-
-    def _has_conflicting_signals(self) -> bool:
-        commits = self.metrics.get("commit_velocity_last_90_days", 0)
-        merge_ratio = self.metrics.get("pr_merge_ratio_pct", 0.0)
-        review_ratio = self.metrics.get("review_to_pr_ratio", 0.0)
-        longevity = self.metrics.get("avg_active_repo_longevity_months", 0.0)
-        return (
-            (commits >= 120 and merge_ratio < 55)
-            or (review_ratio >= 0.5 and longevity < 3)
-            or (commits < 20 and longevity >= 18)
-        )
-
-    def _confidence_for_score(self, score: int, max_score: int, sparse_data: bool, contradictory: bool) -> str:
-        if sparse_data:
-            return "Low"
-        if contradictory:
-            return "Medium"
-        normalized = score / max_score if max_score else 0
-        if normalized >= 0.7:
-            return "High"
-        if normalized >= 0.35:
-            return "Medium"
-        return "Low"
-
-    def _low_signal_reason(self) -> str | None:
-        if not self._is_sparse_profile():
-            return None
-        return "GitHub activity is sparse, so labels are deterministic but low-confidence."
-
-    def _core_stack(self) -> List[str]:
-        stack: List[str] = []
-        seen: set[str] = set()
-        for item in self.metrics.get("top_languages", []):
-            normalized = str(item).strip().lower()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                stack.append(item)
-        for item in self.metrics.get("dominant_frameworks", []):
-            normalized = str(item).strip().lower()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                stack.append(item)
-            if len(stack) >= 5:
-                break
-        return stack[:5]
+            self._trace("risk", "risk_flag", flag, "neutral", f"Risk flag added: {flag}.")
+        return flags
 
     def generate_payload(self) -> Dict[str, Any]:
-        seniority_estimate, seniority_confidence, _ = self._score_seniority()
+        seniority_estimate = self._score_seniority()
         execution_velocity = self._score_execution_velocity()
         lifecycle_fit = self._score_lifecycle_fit()
         collaboration_profile = self._score_collaboration_profile()
-        archetype, archetype_confidence = self._score_archetype()
-        risk_flags, risk_confidence = self._derive_risk_flags()
+        archetype = self._score_archetype()
+        risk_flags = self._derive_risk_flags()
+        engineering_signals = self._engineering_signals()
+        creator_signal = self._creator_signal()
 
         return {
             "seniority_estimate": seniority_estimate,
-            "seniority_confidence": seniority_confidence,
             "archetype": archetype,
-            "archetype_confidence": archetype_confidence,
             "execution_velocity": execution_velocity,
             "lifecycle_fit": lifecycle_fit,
             "collaboration_profile": collaboration_profile,
             "risk_flags": risk_flags,
-            "risk_confidence": risk_confidence,
-            "low_signal_reason": self._low_signal_reason(),
             "core_stack": self._core_stack(),
+            "domain_focus": self.domain_focus,
+            "secondary_domain_focus": self.secondary_domain_focus,
+            "domain_scorecard": self.domain_scorecard,
+            "dimension_scores": self.dimensions,
+            "engineering_signals": engineering_signals,
+            "creator_signal": creator_signal,
             "rule_trace": [trace.to_dict() for trace in self.traces],
             "raw_evidence": self.metrics,
         }

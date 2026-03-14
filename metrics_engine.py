@@ -31,6 +31,13 @@ class BehavioralMetricsEngine:
         except (TypeError, ValueError):
             return None
 
+    def _months_since(self, value):
+        date_value = self._parse_iso_datetime(value)
+        if not date_value:
+            return 0
+        now = datetime.now(timezone.utc)
+        return max(0, (now.year - date_value.year) * 12 + now.month - date_value.month)
+
     def generate_payload(self) -> dict:
         """The main ETL pipeline that outputs the strictly formatted JSON for the LLM."""
         if not self.data:
@@ -76,9 +83,14 @@ class BehavioralMetricsEngine:
         
         # 3. Repository Analysis
         repo_nodes = (self.data.get('repositories') or {}).get('nodes') or []
+        repo_total_count = (self.data.get('repositories') or {}).get('totalCount', 0)
         total_active_repo_months = 0
         valid_active_repos = 0
         active_last_6m = 0
+        stars_on_owned_repos = 0
+        forks_on_owned_repos = 0
+        pinned_topics = []
+        pinned_languages = []
         
         languages = []
         frameworks = []
@@ -90,6 +102,8 @@ class BehavioralMetricsEngine:
             
             created_at = repo.get('createdAt')
             updated_at = repo.get('updatedAt')
+            stars_on_owned_repos += repo.get('stargazerCount', 0) or 0
+            forks_on_owned_repos += repo.get('forkCount', 0) or 0
             
             # Check if active in the last 12 months
             is_active_recently = False
@@ -121,6 +135,24 @@ class BehavioralMetricsEngine:
                 if topic_name:
                     frameworks.append(topic_name)
 
+        pinned_nodes = (self.data.get('pinnedItems') or {}).get('nodes') or []
+        for repo in pinned_nodes:
+            if not repo:
+                continue
+            lang_obj = repo.get('primaryLanguage') or {}
+            lang = lang_obj.get('name')
+            if lang:
+                pinned_languages.append(lang)
+            topics_obj = repo.get('repositoryTopics') or {}
+            topics = topics_obj.get('nodes') or []
+            for t in topics:
+                if not t:
+                    continue
+                topic_obj = t.get('topic') or {}
+                topic_name = topic_obj.get('name')
+                if topic_name:
+                    pinned_topics.append(topic_name)
+
         # 4. Final Mathematical Calculations
         pr_merge_ratio_pct = self._safe_divide(merged_prs * 100, total_recent_prs, 1)
         review_to_pr_ratio = self._safe_divide(reviews, prs_opened, 2)
@@ -136,9 +168,16 @@ class BehavioralMetricsEngine:
         # 5. The Structured Output Payload
         return {
             "name": self.data.get("name") or self.username,
+            "bio": self.data.get("bio") or "",
+            "company": self.data.get("company") or "",
+            "location": self.data.get("location") or "",
+            "followers": ((self.data.get("followers") or {}).get("totalCount") or 0),
+            "following": ((self.data.get("following") or {}).get("totalCount") or 0),
+            "account_age_months": self._months_since(self.data.get("createdAt")),
             "commit_velocity_last_90_days": commits_90d,
             "pull_requests_opened_last_90_days": prs_opened,
             "repositories_contributed_to": repos_contributed_to,
+            "owned_repositories_count": repo_total_count,
             "external_pr_ratio": external_pr_ratio,
             "code_reviews_conducted": reviews,
             "review_to_pr_ratio": review_to_pr_ratio,
@@ -148,6 +187,11 @@ class BehavioralMetricsEngine:
             "merged_prs_count": merged_prs,
             "closed_prs_count": closed_prs,
             "total_recent_prs": total_recent_prs,
+            "stars_on_owned_repos": stars_on_owned_repos,
+            "forks_on_owned_repos": forks_on_owned_repos,
+            "pinned_repositories_count": len(pinned_nodes),
+            "pinned_languages": [item[0] for item in Counter(pinned_languages).most_common(3)],
+            "pinned_topics": [item[0] for item in Counter(pinned_topics).most_common(6)],
             "top_languages": top_languages,
             "dominant_frameworks": dominant_frameworks
         }
